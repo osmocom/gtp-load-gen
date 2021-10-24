@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <netinet/in.h>
+#define _GNU_SOURCE
+#include <getopt.h>
 
 #include <liburing.h>
 #include <pthread.h>
@@ -437,60 +439,192 @@ struct gtp_tunnel_ip_flow *gtp_tunnel_ip_flow_create(struct gtp_tunnel *tun,
 }
 
 
+struct gtpgen_ep_cfg {
+	struct {
+		char *gtp_local_ip;
+		char *gtp_remote_ip_base;
+		char *user_ip_local_base;
+		char *user_ip_remote_base;
+	} addr;
+	unsigned int num_gsns;
+	unsigned int num_tuns_per_gsn;
+	unsigned int num_flows_per_tun;
+};
 
-static void init_flows(void *ctx, unsigned int num_eps, unsigned int num_gsns, unsigned int num_tuns,
-			unsigned int num_flows)
+static int apply_sockaddr_str_offset(struct osmo_sockaddr_str *sastr, unsigned int offset)
 {
-	for (int i = 0; i < num_eps; i++) {
-		struct osmo_sockaddr_str gtp_local_addr;
-		struct gtp_endpoint *ep;
+	struct in_addr ia;
+	struct in6_addr i6a;
+	int rc;
 
-		osmo_sockaddr_str_from_str(&gtp_local_addr, "127.0.0.1", 10000+i);
+	switch (sastr->af) {
+	case AF_INET:
+		rc = osmo_sockaddr_str_to_in_addr(sastr, &ia);
+		OSMO_ASSERT(rc == 0);
+		ia.s_addr = htonl(ntohl(ia.s_addr) + offset);
+		rc = osmo_sockaddr_str_from_in_addr(sastr, &ia, sastr->port);
+		OSMO_ASSERT(rc == 0);
+		break;
+	case AF_INET6:
+		rc = osmo_sockaddr_str_to_in6_addr(sastr, &i6a);
+		OSMO_ASSERT(rc == 0);
+		i6a.s6_addr16[7] = htons(ntohs(i6a.s6_addr16[7]) + offset);
+		rc = osmo_sockaddr_str_from_in6_addr(sastr, &i6a, sastr->port);
+		OSMO_ASSERT(rc == 0);
+		break;
+	default:
+		OSMO_ASSERT(0);
+		break;
+	}
 
-		ep = gtp_endpoint_create(ctx, &gtp_local_addr, NUM_FLOWS_PER_WORKER);
-		OSMO_ASSERT(ep);
+	return 0;
+}
 
-		for (int j = 0; j < num_gsns; j++) {
-			struct osmo_sockaddr_str gtp_remote_addr;
-			struct gtp_peer_gsn *gsn;
-			char strbuf[64];
+static void init_ep(void *ctx, const struct gtpgen_ep_cfg *epcfg, int i)
+{
+	struct osmo_sockaddr_str gtp_local_addr;
+	struct gtp_endpoint *ep;
 
-			sprintf(strbuf, "127.0.0.%u", 1+j);
-			osmo_sockaddr_str_from_str(&gtp_remote_addr, strbuf, 2152);
+	osmo_sockaddr_str_from_str(&gtp_local_addr, epcfg->addr.gtp_local_ip, 10000+i);
 
-			gsn = gtp_peer_gsn_create(ep, &gtp_remote_addr);
-			OSMO_ASSERT(gsn);
+	ep = gtp_endpoint_create(ctx, &gtp_local_addr, NUM_FLOWS_PER_WORKER);
+	OSMO_ASSERT(ep);
 
-			for (int k = 0; k < num_tuns; k++) {
-				struct gtp_tunnel *tun;
+	for (int j = 0; j < epcfg->num_gsns; j++) {
+		struct osmo_sockaddr_str gtp_remote_addr;
+		struct gtp_peer_gsn *gsn;
 
-				tun = gtp_tunnel_create(gsn, (i << 24) | (j << 16) | k);
-				OSMO_ASSERT(tun);
+		osmo_sockaddr_str_from_str(&gtp_remote_addr, epcfg->addr.gtp_remote_ip_base, 2152);
+		apply_sockaddr_str_offset(&gtp_remote_addr, j);
 
-				for (int l = 0; l < num_flows; l++) {
-					struct osmo_sockaddr_str ip_local_addr, ip_remote_addr;
-					sprintf(strbuf, "192.168.222.%u", 1+l);
-					osmo_sockaddr_str_from_str(&ip_local_addr, strbuf, 10000);
+		gsn = gtp_peer_gsn_create(ep, &gtp_remote_addr);
+		OSMO_ASSERT(gsn);
 
-					sprintf(strbuf, "10.255.255.%u", 1+l);
-					osmo_sockaddr_str_from_str(&ip_remote_addr, strbuf, 53);
+		for (int k = 0; k < epcfg->num_tuns_per_gsn; k++) {
+			struct gtp_tunnel *tun;
 
-					gtp_tunnel_ip_flow_create(tun, &ip_local_addr, &ip_remote_addr);
-				}
+			tun = gtp_tunnel_create(gsn, (i << 24) | (j << 16) | k);
+			OSMO_ASSERT(tun);
+
+			for (int l = 0; l < epcfg->num_flows_per_tun; l++) {
+				struct osmo_sockaddr_str ip_local_addr, ip_remote_addr;
+				/* we keep the 'local' side of the IP fixed and change only port */
+				osmo_sockaddr_str_from_str(&ip_local_addr, epcfg->addr.user_ip_local_base, 10000+l);
+				apply_sockaddr_str_offset(&ip_local_addr, k);
+
+				/* we adjust the 'remote' side of the IP */
+				osmo_sockaddr_str_from_str(&ip_remote_addr, epcfg->addr.user_ip_remote_base, 53);
+				apply_sockaddr_str_offset(&ip_remote_addr, l);
+
+				gtp_tunnel_ip_flow_create(tun, &ip_local_addr, &ip_remote_addr);
 			}
 		}
-
-		gtp_endpoint_start(ep);
 	}
+
+	gtp_endpoint_start(ep);
 }
+
+static void print_help(void)
+{
+	printf(
+"gtp-load-gen [-h] [-e NUM_EP] [-g NUM_GSN] [-t NUM_TUN] [-f NUM_FLOW]\n"
+"                  [-l LOCAL_IP] [-r REMOTE_IP] [-s LOCAL_IP] [-d REMOTE_IP]\n"
+"\n"
+"  -h --help\n"
+"  -e --num-endpoints NUM_EP\n"
+"  -g --num-gsn-per-ep NUM_GSN\n"
+"  -t --num-tun-per-gsn NUM_TUN\n"
+"  -f --num-flow-per-tun NUM_FLOW\n"
+"\n"
+"  -l --gtp-local-ip LOCAL_IP\n"
+"  -r --gtp-remote-ip REMOTE_IP\n"
+"  -s --userip-local-base LOCAL_IP\n"
+"  -d --userip-remote-base REMOTE_IP\n"
+	);
+}
+
+static const struct option opts[] = {
+	{ "help", 0, 0, 'h' },
+	{ "num-endpoints", 1, 0, 'e' },
+	{ "num-gsn-per-ep", 1, 0, 'g' },
+	{ "num-tun-per-gsn", 1, 0, 't' },
+	{ "num-flow-per-tun", 1, 0, 'f' },
+
+	{ "gtp-local-ip", 1, 0, 'l' },
+	{ "gtp-remot-ip-base", 1, 0, 'r' },
+	{ "userip-local-base", 1, 0, 's' },
+	{ "userip-remote-base", 1, 0, 'd' },
+	{ NULL, 0, 0, 0 }
+};
 
 int main(int argc, char **argv)
 {
 	void *g_ctx = talloc_named_const(NULL, 1, "gtpgen");
+	int num_endpoints = 1;
+	struct gtpgen_ep_cfg epcfg = {
+		.addr = {
+			.gtp_local_ip = "127.0.0.1",
+			.gtp_remote_ip_base = "127.0.0.1",
+			.user_ip_local_base = "192.168.222.1",
+			.user_ip_remote_base = "10.255.255.0",
+		},
+		.num_gsns = 4,
+		.num_tuns_per_gsn = 100,
+		.num_flows_per_tun = 10,
+	};
 
 	osmo_init_logging2(g_ctx, NULL);
 
-	init_flows(g_ctx, 2, 4, 100, 10);
+	while (1) {
+		int option_index = 0;
+
+		int c = getopt_long(argc, argv, "he:g:t:f:l:r:s:d:", opts, &option_index);
+		if (c == -1)
+			break;
+
+		switch (c) {
+		case 'h':
+			print_help();
+			exit(0);
+			break;
+		case 'e':
+			num_endpoints = atoi(optarg);
+			break;
+		case 'g':
+			epcfg.num_gsns = atoi(optarg);
+			break;
+		case 't':
+			epcfg.num_tuns_per_gsn = atoi(optarg);
+			break;
+		case 'f':
+			epcfg.num_flows_per_tun = atoi(optarg);
+			break;
+		case 'l':
+			epcfg.addr.gtp_local_ip = optarg;
+			break;
+		case 'r':
+			epcfg.addr.gtp_remote_ip_base = optarg;
+			break;
+		case 's':
+			epcfg.addr.user_ip_local_base = optarg;
+			break;
+		case 'd':
+			epcfg.addr.user_ip_remote_base = optarg;
+			break;
+		}
+	}
+
+	printf("CFG: %u endpoints; %u GSN per endpoint; %u tunnels per GSN; %u user IP/UDP flows per tunnel\n",
+		num_endpoints, epcfg.num_gsns, epcfg.num_tuns_per_gsn, epcfg.num_flows_per_tun);
+
+	printf("==>: %u GSNs, %u TEIDs, %u user IP/UDP flows\n",
+		num_endpoints * epcfg.num_gsns,
+		num_endpoints * epcfg.num_gsns * epcfg.num_tuns_per_gsn,
+		num_endpoints * epcfg.num_gsns * epcfg.num_tuns_per_gsn * epcfg.num_flows_per_tun);
+
+	for (int i = 0; i < num_endpoints; i++) {
+		init_ep(g_ctx, &epcfg, i);
+	}
 
 	while (1) {
 		osmo_select_main(0);
