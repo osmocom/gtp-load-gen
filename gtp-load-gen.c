@@ -400,11 +400,11 @@ struct gtp_tunnel_ip_flow *gtp_tunnel_ip_flow_create(struct gtp_tunnel *tun,
 		iph->daddr = daddr.s_addr;
 		iph->check = ip_fast_csum(iph, iph->ihl);
 	} else {
-		ip6h = (struct ip6_hdr *) flow->pkt_buf + sizeof(*gtp_hdr);
+		ip6h = (struct ip6_hdr *) cur;
 		cur += sizeof(*ip6h);
 
-		//ip6h->ip6_flow = ; // TODO
-		ip6h->ip6_plen = htons(udp_len + sizeof(struct udphdr) + sizeof(*ip6h));
+		ip6h->ip6_flow = htonl((6 << 28));
+		ip6h->ip6_plen = htons(udp_len + sizeof(struct udphdr));
 		ip6h->ip6_nxt = IPPROTO_UDP;
 		ip6h->ip6_hlim = 32;
 		osmo_sockaddr_str_to_in6_addr(&flow->config.local, &ip6h->ip6_src);
