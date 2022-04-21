@@ -449,6 +449,7 @@ struct gtpgen_ep_cfg {
 	unsigned int num_gsns;
 	unsigned int num_tuns_per_gsn;
 	unsigned int num_flows_per_tun;
+	unsigned int teid_offset;
 };
 
 static int apply_sockaddr_str_offset(struct osmo_sockaddr_str *sastr, unsigned int offset)
@@ -503,7 +504,7 @@ static void init_ep(void *ctx, const struct gtpgen_ep_cfg *epcfg, int i)
 		for (int k = 0; k < epcfg->num_tuns_per_gsn; k++) {
 			struct gtp_tunnel *tun;
 
-			tun = gtp_tunnel_create(gsn, (i << 24) | (j << 16) | k);
+			tun = gtp_tunnel_create(gsn, ((i << 24) | (j << 16) | k) + epcfg->teid_offset);
 			OSMO_ASSERT(tun);
 
 			for (int l = 0; l < epcfg->num_flows_per_tun; l++) {
@@ -540,6 +541,7 @@ static void print_help(void)
 "  -r --gtp-remote-ip REMOTE_IP\n"
 "  -s --userip-local-base LOCAL_IP\n"
 "  -d --userip-remote-base REMOTE_IP\n"
+"  -T --teid-offset TEID\n"
 	);
 }
 
@@ -554,6 +556,7 @@ static const struct option opts[] = {
 	{ "gtp-remot-ip-base", 1, 0, 'r' },
 	{ "userip-local-base", 1, 0, 's' },
 	{ "userip-remote-base", 1, 0, 'd' },
+	{ "teid-offset", 1, 0, 'T'},
 	{ NULL, 0, 0, 0 }
 };
 
@@ -571,6 +574,7 @@ int main(int argc, char **argv)
 		.num_gsns = 4,
 		.num_tuns_per_gsn = 100,
 		.num_flows_per_tun = 10,
+		.teid_offset = 0,
 	};
 
 	osmo_init_logging2(g_ctx, NULL);
@@ -578,7 +582,7 @@ int main(int argc, char **argv)
 	while (1) {
 		int option_index = 0;
 
-		int c = getopt_long(argc, argv, "he:g:t:f:l:r:s:d:", opts, &option_index);
+		int c = getopt_long(argc, argv, "he:g:t:f:l:r:s:d:T:", opts, &option_index);
 		if (c == -1)
 			break;
 
@@ -610,6 +614,9 @@ int main(int argc, char **argv)
 			break;
 		case 'd':
 			epcfg.addr.user_ip_remote_base = optarg;
+			break;
+		case 'T':
+			epcfg.teid_offset = atoi(optarg);
 			break;
 		}
 	}
